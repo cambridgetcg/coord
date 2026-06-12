@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""coord — lightweight presence + soft claims for parallel Claude Code sessions.
+
+Shared state on the filesystem (the only thing sessions share). Opt-in, advisory.
+Identity = $CLAUDE_CODE_SESSION_ID (every Bash call in a session inherits it).
+Python stdlib only, so it runs from any shell without node/fnm on PATH.
+"""
+import json, os, sys, time, subprocess
+from pathlib import Path
+
+DIR = Path.home() / ".claude" / "coord"
+SDIR = DIR / "sessions"
+SDIR.mkdir(parents=True, exist_ok=True)
+
+SID = os.environ.get("CLAUDE_CODE_SESSION_ID") or f"local-{os.getpid()}"
+SHORT = SID[:8]
+TTL = 20 * 60  # seconds; "active" if seen within this
+HOME = str(Path.home())
+
+def c(code, s): return f"\x1b[{code}m{s}\x1b[0m"
+dim = lambda s: c("2", s); bold = lambda s: c("1", s)
+grn = lambda s: c("32", s); yel = lambda s: c("33", s); red = lambda s: c("31", s)
+
+def git(cwd):
+    def run(args):
+        try:
+            return subprocess.run(["git"] + args, cwd=cwd, capture_output=True, text=True, timeout=5).stdout.strip() or None
+        except Exception:
+            return None
+    top = run(["rev-parse", "--show-toplevel"])
+    branch = run(["rev-parse", "--abbrev-ref", "HEAD"])
+    return (top.split("/")[-1] if top else None), branch
+
+def load():
+    out = []
+    for f in SDIR.glob("*.json"):
+        try: out.append(json.loads(f.read_text()))
+        except Exception: pass
+    return out
+
+def selfrec():
+    p = SDIR / f"{SID}.json"
+    return json.loads(p.read_text()) if p.exists() else {"id": SID, "started": time.time()}
+
+def save(o):
+    o["heartbeat"] = time.time()
+    repo, branch = git(os.getcwd())
+    o["cwd"] = os.getcwd().replace(HOME, "~")
+    o["repo"], o["branch"] = repo, branch
+    o["short"] = SHORT
+    p = SDIR / f"{SID}.json"; tmp = SDIR / f"{SID}.json.tmp"
+    tmp.write_text(json.dumps(o, indent=2)); tmp.replace(p)
+    return o
+
+def age(t):
+    m = int((time.time() - t) / 60)
+    if m < 1: return "now"
+    if m < 60: return f"{m}m"
+    h = m // 60
+    return f"{h}h" if h < 24 else f"{h//24}d"
+
+def live(s): return time.time() - s.get("heartbeat", 0) < TTL
+
+def overlaps(a, b):
+    if not a or not b: return False
+    a, b = a.lower(), b.lower()
+    return (a == b or a.startswith(b + "/") or b.startswith(a + "/")
+            or (b in a and len(b) > 3) or (a in b and len(a) > 3))
+
+def status():
+    rows = sorted(load(), key=lambda s: -s.get("heartbeat", 0))
+    if not rows:
+        print(dim("no sessions registered. run: coord register")); return
+    print(bold("    session   who               where                  claim"))
+    for s in rows:
+        dot = grn("●") if live(s) else dim("○")
+        me = dim(" me") if s["id"] == SID else "   "
+        where = " ".join(x for x in [s.get("repo"), f"@{s['branch']}" if s.get("branch") and s["branch"] != "HEAD" else ""] if x) or (s.get("cwd") or "?")
+        claim = yel(s["claim"]) if s.get("claim") else dim("—")
+        note = dim("  · " + s["note"]) if s.get("note") else ""
+        print(f"{dot}{me} {s.get('short','?'):8}  {(s.get('label') or '?')[:16]:16}  {where[:22]:22}  {claim}{note}  {dim(age(s.get('heartbeat',0)))}")
+
+def main():
+    args = sys.argv[1:]
+    cmd = args[0] if args else "status"
+    arg = " ".join(args[1:]).strip()
+
+    if cmd in ("status", "who", "ls"):
+        status()
+    elif cmd in ("register", "hi"):
+        s = selfrec(); s["id"] = SID
+        if arg: s["label"] = arg
+        if not s.get("label"): s["label"] = git(os.getcwd())[0] or "session"
+        save(s); print(grn(f"✓ registered as {bold(s['label'])} ({SHORT})")); print(); status()
+    elif cmd == "claim":
+        if not arg: print("usage: coord claim <area> [— note]"); return
+        parts = arg.split(" — ", 1)
+        area = parts[0].strip(); note = parts[1].strip() if len(parts) > 1 else None
+        conflicts = [s for s in load() if s["id"] != SID and live(s) and overlaps(s.get("claim"), area)]
+        if conflicts:
+            print(red("⚠ overlaps a live claim:"))
+            for x in conflicts:
+                print(red(f'   {x.get("label")} ({x.get("short")}) holds "{x.get("claim")}" {dim(age(x["heartbeat"]) + " ago")}'))
+            print(dim("   (soft claim — claiming anyway; coordinate with them first)"))
+        s = selfrec(); s["id"] = SID
+        if not s.get("label"): s["label"] = git(os.getcwd())[0] or "session"
+        s["claim"] = area
+        if note: s["note"] = note
+        save(s); print(grn(f"✓ claimed {bold(area)}") + (dim(f"  · {note}") if note else ""))
+    elif cmd == "note":
+        s = selfrec(); s["id"] = SID; s["note"] = arg; save(s); print(grn(f"✓ note: {arg}"))
+    elif cmd == "release":
+        s = selfrec(); s.pop("claim", None); s.pop("note", None); save(s); print(grn("✓ released claim"))
+    elif cmd in ("done", "bye"):
+        p = SDIR / f"{SID}.json"
+        if p.exists(): p.unlink()
+        print(grn("✓ checked out — session record removed"))
+    elif cmd == "prune":
+        n = 0
+        for s in load():
+            if not live(s): (SDIR / f"{s['id']}.json").unlink(missing_ok=True); n += 1
+        print(grn(f"✓ pruned {n} stale session(s)")); print(); status()
+    else:
+        print("""coord — presence + soft claims for parallel sessions
+  coord register [label]      announce yourself
+  coord claim <area> — note   soft-claim a repo/area (warns on overlap)
+  coord note <msg>            update what you're doing
+  coord release               drop your claim
+  coord status                who's live + what they hold  (also: who, ls, no arg)
+  coord done                  check out (remove your record)
+  coord prune                 clear stale (>20m) records""")
+
+if __name__ == "__main__":
+    main()
